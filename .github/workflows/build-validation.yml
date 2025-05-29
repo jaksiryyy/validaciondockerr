@@ -1,1 +1,226 @@
+# Workflow para validación de configuración de compilación
+name: Build Validation
 
+# Ejecutar en push y pull requests
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  # Job para comprobaciones básicas de compilación
+  build-checks:
+    name: Build Checks
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      
+    # Verificar que los archivos de configuración existen
+    - name: Validate configuration files
+      run: |
+        echo "Validando archivos de configuración..."
+        if [ -f "Dockerfile" ]; then
+          echo "✅ Dockerfile encontrado"
+        else
+          echo "❌ Dockerfile no encontrado"
+          exit 1
+        fi
+        
+        if [ -f "docker-bake.hcl" ] || [ -f "docker-compose.yml" ]; then
+          echo "✅ Archivo de configuración bake encontrado"
+        else
+          echo "⚠️ No se encontró docker-bake.hcl o docker-compose.yml"
+        fi
+    
+    # Lint del Dockerfile
+    - name: Lint Dockerfile
+      uses: hadolint/hadolint-action@v3.1.0
+      with:
+        dockerfile: Dockerfile
+        
+    # Validar sintaxis de docker-compose si existe
+    - name: Validate docker-compose syntax
+      if: hashFiles('docker-compose.yml') != ''
+      run: |
+        docker-compose -f docker-compose.yml config --quiet
+
+  # Job para comprobaciones con docker/build
+  docker-build:
+    name: Docker Build Validation
+    runs-on: ubuntu-latest
+    needs: build-checks
+    
+    strategy:
+      matrix:
+        platform:
+          - linux/amd64
+          - linux/arm64
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      
+    # Build para validar que la imagen se construye correctamente
+    - name: Build Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: ${{ matrix.platform }}
+        push: false
+        tags: |
+          app:latest
+          app:${{ github.sha }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    # Test básico de la imagen construida (solo para linux/amd64)
+    - name: Test built image
+      if: matrix.platform == 'linux/amd64'
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64
+        push: false
+        tags: app:test
+        load: true
+        
+    - name: Run basic container test
+      if: matrix.platform == 'linux/amd64'
+      run: |
+        # Ejecutar contenedor y verificar que inicia correctamente
+        docker run --rm -d --name test-container app:test
+        sleep 5
+        
+        # Verificar que el contenedor está corriendo
+        if docker ps | grep -q test-container; then
+          echo "✅ Contenedor iniciado correctamente"
+          docker stop test-container
+        else
+          echo "❌ El contenedor no pudo iniciarse"
+          docker logs test-container || true
+          exit 1
+        fi
+
+  # Job para comprobaciones con docker/bake
+  docker-bake:
+    name: Docker Bake Validation
+    runs-on: ubuntu-latest
+    needs: build-checks
+    if: hashFiles('docker-bake.hcl') != '' || hashFiles('docker-compose.yml') != ''
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@v3
+      
+    # Validar configuración de bake
+    - name: Validate bake configuration
+      run: |
+        if [ -f "docker-bake.hcl" ]; then
+          echo "Validando docker-bake.hcl..."
+          docker buildx bake --print
+        elif [ -f "docker-compose.yml" ]; then
+          echo "Validando docker-compose.yml para bake..."
+          docker buildx bake -f docker-compose.yml --print
+        fi
+        
+    # Build usando bake
+    - name: Build with docker bake
+      run: |
+        if [ -f "docker-bake.hcl" ]; then
+          docker buildx bake --set="*.cache-from=type=gha" --set="*.cache-to=type=gha,mode=max"
+        elif [ -f "docker-compose.yml" ]; then
+          docker buildx bake -f docker-compose.yml --set="*.cache-from=type=gha" --set="*.cache-to=type=gha,mode=max"
+        fi
+
+  # Job para análisis de seguridad
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: docker-build
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Build image for scanning
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        push: false
+        tags: app:scan
+        load: true
+        
+    # Escaneo de vulnerabilidades con Trivy
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'app:scan'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      if: always()
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Job final de resumen
+  validation-summary:
+    name: Validation Summary
+    runs-on: ubuntu-latest
+    needs: [build-checks, docker-build, docker-bake, security-scan]
+    if: always()
+    
+    steps:
+    - name: Validation Summary
+      run: |
+        echo "## 📋 Resumen de Validación de Compilación" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        
+        if [ "${{ needs.build-checks.result }}" == "success" ]; then
+          echo "✅ **Comprobaciones básicas**: Exitosas" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Comprobaciones básicas**: Fallidas" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ "${{ needs.docker-build.result }}" == "success" ]; then
+          echo "✅ **Docker Build**: Exitoso" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Docker Build**: Fallido" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ "${{ needs.docker-bake.result }}" == "success" ] || [ "${{ needs.docker-bake.result }}" == "skipped" ]; then
+          echo "✅ **Docker Bake**: Exitoso" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Docker Bake**: Fallido" >> $GITHUB_STEP_SUMMARY
+        fi
+        
+        if [ "${{ needs.security-scan.result }}" == "success" ]; then
+          echo "✅ **Escaneo de seguridad**: Exitoso" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "❌ **Escaneo de seguridad**: Fallido" >> $GITHUB_STEP_SUMMARY
+        fi
