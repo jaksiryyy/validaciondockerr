@@ -8,7 +8,7 @@ variable "REGISTRY" {
 }
 
 variable "REPO" {
-  default = "tu-usuario/tu-repo"
+  default = "jaksiryyy/validaciondockerr"
 }
 
 # Grupo por defecto
